@@ -1,0 +1,37 @@
+# PlatformIO
+.pio/
+.vscode/
+.idea/
+
+# Python virtual environment
+venv/
+bin/
+__pycache__/
+*.pyc
+
+# Compiled firmware files
+*.bin
+*.elf
+
+# OS generated files
+.DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
+
+# Editor files
+*~
+*.swp
+*.swo
+.vscode/settings.json
+
+# Temporary files
+*.tmp
+*.temp
+*.log
+
+# Project specific
+plan.md
