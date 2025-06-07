@@ -202,7 +202,7 @@ Setup complete!
 - **Ethernet Auto-Switch**: Plug in cable anytime → auto-switches
 - **Fallback**: If Ethernet unplugged → switches back to WiFi
 
-### **🔍 Easy Network Discovery**
+### **Easy Network Discovery**
 
 **Your ESP32 is now super easy to find on any network!**
 

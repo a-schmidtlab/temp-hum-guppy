@@ -1,10 +1,10 @@
-# 🔍 Finding Your ESP32 Sensor in Any Network
+# Finding Your ESP32 Sensor in Any Network
 
 This guide helps non-technical users easily find and access their ESP32 temperature sensor when plugged into foreign networks (hotels, offices, friends' homes, etc.).
 
-## 🎯 Quick Access Methods (Easiest to Hardest)
+## Quick Access Methods (Easiest to Hardest)
 
-### Method 1: Use the Magic Address (.local) ⭐ **RECOMMENDED**
+### Method 1: Use the Magic Address (.local) **RECOMMENDED**
 - **What to do**: Open any web browser and type: `http://tr-cam1-t-h-sensor.local`
 - **Works on**: Most modern networks (Windows 10+, Mac, Linux, phones)
 - **Why it works**: Your device announces itself automatically
@@ -19,7 +19,7 @@ This guide helps non-technical users easily find and access their ESP32 temperat
 - **Works on**: All networks where you have router access
 - **Why it works**: Your device tells the router its name
 
-### Method 3: Network Scanner Apps 📱
+### Method 3: Network Scanner Apps
 - **Android**: "Fing" or "Network Scanner" (free apps)
 - **iPhone**: "Fing" or "Network Analyzer" 
 - **Computer**: "Advanced IP Scanner" (Windows) or "LanScan" (Mac)
@@ -31,7 +31,7 @@ This guide helps non-technical users easily find and access their ESP32 temperat
 - **Look for**: Big box with IP address after connection
 - **For**: Technical users or when other methods fail
 
-## 🚨 LED Status Indicators
+## LED Status Indicators
 
 Your ESP32 has a built-in LED that shows connection status:
 
@@ -42,7 +42,7 @@ Your ESP32 has a built-in LED that shows connection status:
 | 1 long blink | Network disconnected |
 | 1 quick blink every 5 min | Taking sensor reading |
 
-## 🔧 Troubleshooting Guide
+## Troubleshooting Guide
 
 ### "tr-cam1-t-h-sensor.local" doesn't work?
 1. **Try with different browsers**: Chrome, Firefox, Safari, Edge
@@ -66,27 +66,27 @@ Your ESP32 has a built-in LED that shows connection status:
 3. **Power cycle**: Unplug and replug the ESP32
 4. **Check WiFi name**: Make sure it's connecting to the right network (look at source code)
 
-## 📱 Mobile Access Tips
+## Mobile Access Tips
 
 - **Bookmark it**: Once you find the address, bookmark `http://tr-cam1-t-h-sensor.local`
 - **Add to home screen**: Most browsers let you add web pages as app icons
 - **Works offline**: Once the page loads, charts work without internet
 
-## 🌐 Network Compatibility
+## Network Compatibility
 
 | Network Type | .local Access | Router Access | Scanner Apps |
 |--------------|---------------|---------------|--------------|
-| Home WiFi | ✅ Yes | ✅ Yes | ✅ Yes |
-| Hotel WiFi | ⚠️ Maybe | ❌ No | ⚠️ Maybe |
-| Office WiFi | ⚠️ Maybe | ⚠️ Maybe | ⚠️ Maybe |
-| Mobile Hotspot | ✅ Yes | ✅ Yes | ✅ Yes |
-| Public WiFi | ❌ Usually No | ❌ No | ❌ Usually No |
+| Home WiFi | Yes | Yes | Yes |
+| Hotel WiFi | Maybe | No | Maybe |
+| Office WiFi | Maybe | Maybe | Maybe |
+| Mobile Hotspot | Yes | Yes | Yes |
+| Public WiFi | Usually No | No | Usually No |
 
-## 🔒 Security Note
+## Security Note
 
 Your device only works on the local network - it's not accessible from the internet, making it safe to use on foreign networks.
 
-## 💡 Pro Tips
+## Pro Tips
 
 1. **Take a photo** of the serial output showing the IP address when first setting up
 2. **Write down the WiFi name** your device connects to (from source code)
