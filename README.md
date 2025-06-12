@@ -7,13 +7,16 @@ A temperature and humidity monitoring solution using ESP32-Eth01 and DHT11 senso
 
 ##  Features
 
-- **Real-time monitoring** of temperature and humidity
-- **Beautiful web dashboard** with interactive charts
-- **Multiple time ranges**: 24 hours, 7 days, 30 days
-- **Automatic network switching**: WiFi ↔ Ethernet
-- **Auto-refresh**: Updates every 30 seconds
-- **Data logging**: Stores historical data
-- **Responsive design**: Works on mobile and desktop
+- **Real-time monitoring** of temperature and humidity (30-second intervals)
+- **Beautiful web dashboard** with interactive charts and auto-scaling
+- **Smart data retention**: Detailed (30min) + Aggregated (24h) + Combined views
+- **🚨 Enterprise-style alert system** with Star Trek bridge sounds and visual effects
+- **Temperature threshold alerts** (configurable, default: 40°C)
+- **Automatic network switching**: WiFi ↔ Ethernet with easy discovery
+- **Auto-refresh**: Updates every 30 seconds with network status indicators
+- **Data logging**: Intelligent buffering with detailed and aggregated storage
+- **Responsive design**: Works perfectly on mobile and desktop
+- **Network discovery**: Access via hostname (tr-cam1-t-h-sensor.local)
 
 ## Hardware Requirements (Bill of Materials)
 
@@ -148,15 +151,93 @@ pio run
 
 ###  **Upload Firmware**
 
-1. **Put ESP32 in programming mode** (GPIO0 → GND, reset)
-2. **Flash firmware:**
+#### **Method 1: Simple Upload with Manual Reset (Recommended - Most Reliable)**
+
+This method works reliably when the ESP32-ETH01 board lacks a physical BOOT button:
+
+1. **Prepare hardware:**
+   - Connect USB-TTL adapter to ESP32 (TX→U0RXD, RX→U0TXD, GND→GND)
+   - Ensure ESP32 is powered (5V supply connected)
+   - Have a jumper wire ready for GPIO0→GND connection
+
+2. **Start upload process:**
+   ```bash
+   source venv/bin/activate
+   pio run --target upload
+   ```
+
+3. **Watch for connection phase:**
+   - Monitor terminal output for "Connecting..." with dots appearing
+   - **Critical timing**: As soon as you see "Connecting..................", perform the manual reset
+
+4. **Manual reset sequence (timing is everything):**
+   - **Quickly connect GPIO0 to GND** with jumper wire
+   - **Immediately reset ESP32** (briefly touch EN pin to GND or power cycle)
+   - **Keep GPIO0 connected to GND** throughout the entire upload process
+
+5. **Success indicators (you'll see these if timing was correct):**
+   - Terminal shows: "Chip is ESP32-D0WD-V3 (revision v3.1)"
+   - **Hex addresses with percentages**: 
+     ```
+     Writing at 0x00010000... (2 %)
+     Writing at 0x0001d8f3... (5 %)
+     Writing at 0x0002a56e... (7 %)
+     ...
+     Writing at 0x000fa724... (100 %)
+     ```
+   - Upload completes: "**[SUCCESS] Took X seconds**"
+
+6. **Exit programming mode:**
+   - **Disconnect GPIO0 from GND**
+   - **Reset ESP32** (briefly touch EN to GND)
+   - ESP32 boots in normal mode
+
+**💡 Pro Tips:**
+- **Perfect timing is crucial** - reset exactly when the dots start appearing
+- **If upload fails**, just try again - the timing takes practice
+- **Successful uploads show hex addresses** - if you don't see them, timing was off
+
+#### **Method 2: Standard Upload (If Method 1 Fails)**
 
 ```bash
+# Alternative approach - put in programming mode first
+# 1. Connect GPIO0 to GND
+# 2. Reset ESP32
+# 3. Run upload command
 source venv/bin/activate
 pio run -t upload
+
+# 4. When upload completes, disconnect GPIO0 from GND
+# 5. Reset ESP32
 ```
 
-3. **Remove GPIO0 from GND** and reset ESP32
+#### **Upload Configuration (platformio.ini)**
+
+The project includes optimized upload settings:
+
+```ini
+upload_speed = 115200          # Reliable speed for ESP32-ETH01
+upload_resetmethod = nodemcu   # Compatible reset method
+upload_flags = 
+    --before=default_reset     # Reset before upload
+    --after=hard_reset         # Hard reset after upload
+    --connect-attempts=30      # More connection attempts
+```
+
+#### **Troubleshooting Upload Issues**
+
+| Error | Cause | Solution |
+|-------|-------|----------|
+| `Could not open /dev/ttyUSB0` | USB-TTL not detected | Check USB connection, install drivers |
+| `Failed to connect to ESP32` | Not in programming mode | Use Method 1 with manual reset timing |
+| `No serial data received` | Wrong timing or wiring | Check GPIO0→GND during "Connecting..." |
+| Upload starts but fails | Power issues | Ensure adequate 5V power supply (≥1A) |
+
+**⚠️ Critical Notes:**
+- **Timing is crucial** - reset exactly when "Connecting..." dots appear
+- **Keep GPIO0 grounded** until you see hex addresses and percentages
+- **Never connect USB-TTL VCC** to ESP32 (ESP32 separately powered)
+- **Use adequate power supply** - insufficient current causes upload failures
 
 ### **Monitor Serial Output**
 
@@ -190,11 +271,24 @@ Setup complete!
 
 ### **Dashboard Features**
 
-- **Current readings** displayed prominently
-- **Time range selector**: 24h / 7d / 30d
-- **Interactive charts** for temperature and humidity
-- **Auto-refresh** every 30 seconds
-- **Responsive design** works on mobile
+- **Real-time current readings** displayed prominently
+- **Time range selector**: Detailed (30s intervals, 30min), Aggregated (5min intervals, 24h), Combined (all data)
+- **Interactive charts** for temperature and humidity with auto-scaling
+- **Auto-refresh** every 30 seconds for current data
+- **Responsive design** works on mobile and desktop
+
+#### **🚨 Enterprise-Style Alert System**
+
+- **Temperature threshold alerts** (default: 40°C, user-configurable)
+- **Star Trek Enterprise bridge-style alert sound** using Web Audio API
+- **Visual red alert animation** with flashing background
+- **Alert status indicators**:
+  - ✅ Normal: Temperature within limits
+  - 🚨 **RED ALERT**: Temperature critical (with sound and animation)
+  - ⚠️ Alert acknowledged: Temperature still elevated but user notified
+- **One-click alert acknowledgment** to stop sound
+- **Alert text**: "🚨 RED ALERT! TEMPERATURE CRITICAL!"
+- **Console logging** for debugging alert system
 
 ### **Network Switching**
 
@@ -267,16 +361,20 @@ See detailed guide: **[NETWORK_DISCOVERY.md](NETWORK_DISCOVERY.md)**
 
 ### **API Endpoints**
 
-- `GET /` - Main dashboard
-- `GET /api/current` - Current temperature/humidity JSON
-- `GET /api/history?range=24h|7d|30d` - Historical data JSON
+- `GET /` - Main dashboard with Enterprise alert system
+- `GET /api/current` - Current temperature/humidity JSON with sampling info
+- `GET /api/history?range=detailed|aggregated|all` - Historical data JSON
+- `GET /api/alert/get` - Current alert status and threshold
+- `POST /api/alert/set` - Set temperature alert threshold (°C)
+- `POST /api/alert/acknowledge` - Acknowledge active temperature alert
 
 ### **Data Storage**
 
-- **24h buffer**: Ring buffer in RAM (288 samples)
-- **7d buffer**: Persistent storage (2,016 samples)  
-- **30d buffer**: Persistent storage (8,640 samples)
-- **Hourly saves**: Reduces flash wear
+- **Detailed buffer**: 30 minutes of 30-second samples in RAM (60 samples)
+- **Aggregated buffer**: ~24 hours of 5-minute averages in RAM (288 samples)
+- **Smart aggregation**: Automatically converts old detailed data to 5-minute averages
+- **Memory efficient**: Uses std::deque and std::vector for optimal performance
+- **Real-time processing**: No flash wear from constant writing
 
 *END*
 
