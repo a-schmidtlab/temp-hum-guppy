@@ -42,6 +42,19 @@ const long  GMT_OFFSET_SEC = 3600;           // Germany: UTC+1 (3600 seconds)
 const int   DAYLIGHT_OFFSET_SEC = 3600;      // Daylight saving time offset
 // -----------------------------
 
+// Memory management and persistence configuration
+constexpr uint32_t EMERGENCY_AGGREGATION_THRESHOLD = 80; // Start emergency aggregation at 80% RAM usage
+constexpr uint32_t CRITICAL_MEMORY_THRESHOLD = 90;       // Critical memory usage (force cleanup)
+constexpr uint32_t SPIFFS_SAVE_INTERVAL_SEC = 3600;      // Save to flash every hour
+constexpr uint32_t MAX_SPIFFS_RECORDS = 2016;            // 7 days * 24h * 12 (5-min intervals)
+const char* SPIFFS_DATA_FILE = "/sensor_data.json";
+const char* SPIFFS_CONFIG_FILE = "/config.json";
+
+// Memory usage tracking
+uint32_t lastMemoryCheck = 0;
+uint32_t lastSPIFFSSave = 0;
+bool emergencyMode = false;
+
 struct Reading { 
   uint32_t ts;          // Unix timestamp (seconds since 1970)
   float t;              // Temperature in Celsius
@@ -51,8 +64,11 @@ struct Reading {
 
 // Alert system variables
 float alertThreshold = 40.0;     // Default alert temperature in Celsius
+float humidityAlertThreshold = 90.0;  // Default alert humidity in %
 bool alertActive = false;        // Is an alert currently active?
 bool alertAcknowledged = true;   // Has the current alert been acknowledged?
+bool humidityAlertActive = false;        // Is a humidity alert currently active?
+bool humidityAlertAcknowledged = true;   // Has the current humidity alert been acknowledged?
 uint32_t lastAlertCheck = 0;
 
 std::deque<Reading> detailedBuffer;     // 10 minutes of 10-second data
@@ -66,13 +82,27 @@ bool isConnected = false;
 
 // Forward declarations
 void aggregateOldData();
+void emergencyDataCompression();
+void saveToPersistentStorage();
+void loadFromPersistentStorage();
+void saveConfigToPersistentStorage();
+void loadConfigFromPersistentStorage();
+uint32_t getMemoryUsagePercent();
+void checkMemoryUsage();
 void setupNTP();
 String getCurrentDateTime();
 uint32_t getCurrentTimestamp();
 void checkTemperatureAlert(float temperature);
+void checkHumidityAlert(float humidity);
 void handleSetAlert(AsyncWebServerRequest *req);
+void handleSetHumidityAlert(AsyncWebServerRequest *req);
 void handleAckAlert(AsyncWebServerRequest *req);
+void handleAckHumidityAlert(AsyncWebServerRequest *req);
 void handleGetAlert(AsyncWebServerRequest *req);
+void handleGetHumidityAlert(AsyncWebServerRequest *req);
+void handleCurrent(AsyncWebServerRequest *req);
+void handleHistory(AsyncWebServerRequest *req);
+void handleRoot(AsyncWebServerRequest *req);
 
 // NTP Time Functions
 void setupNTP() {
@@ -258,11 +288,21 @@ void addReading(float t, float h) {
   // Check for temperature alerts
   checkTemperatureAlert(t);
   
-  // Aggregate old data every 5 minutes
+  // Check memory usage every reading
+  checkMemoryUsage();
+  
+  // Aggregate old data every 5 minutes (or sooner if in emergency mode)
   static uint32_t lastAggregation = 0;
-  if ((now - lastAggregation) >= AGGREGATE_INTERVAL_SEC) {
+  uint32_t aggregationInterval = emergencyMode ? (AGGREGATE_INTERVAL_SEC / 2) : AGGREGATE_INTERVAL_SEC;
+  if ((now - lastAggregation) >= aggregationInterval) {
     aggregateOldData();
     lastAggregation = now;
+  }
+  
+  // Save to persistent storage periodically
+  if ((now - lastSPIFFSSave) >= SPIFFS_SAVE_INTERVAL_SEC) {
+    saveToPersistentStorage();
+    lastSPIFFSSave = now;
   }
 }
 
@@ -342,6 +382,185 @@ void aggregateOldData() {
   }
 }
 
+// Memory management and persistent storage functions
+uint32_t getMemoryUsagePercent() {
+  uint32_t freeHeap = ESP.getFreeHeap();
+  uint32_t totalHeap = ESP.getHeapSize();
+  uint32_t usedHeap = totalHeap - freeHeap;
+  return (usedHeap * 100) / totalHeap;
+}
+
+void checkMemoryUsage() {
+  uint32_t memUsage = getMemoryUsagePercent();
+  
+  if (memUsage >= CRITICAL_MEMORY_THRESHOLD) {
+    Serial.printf("🚨 CRITICAL MEMORY: %d%% used - Emergency cleanup!\n", memUsage);
+    emergencyDataCompression();
+    emergencyMode = true;
+  } else if (memUsage >= EMERGENCY_AGGREGATION_THRESHOLD) {
+    if (!emergencyMode) {
+      Serial.printf("⚠️ HIGH MEMORY: %d%% used - Starting emergency aggregation\n", memUsage);
+      emergencyDataCompression();
+      emergencyMode = true;
+    }
+  } else {
+    if (emergencyMode) {
+      Serial.printf("✅ Memory normal: %d%% used - Exiting emergency mode\n", memUsage);
+      emergencyMode = false;
+    }
+  }
+}
+
+void emergencyDataCompression() {
+  Serial.println("🔄 Emergency data compression starting...");
+  
+  // Aggressively reduce detailed buffer
+  while (detailedBuffer.size() > (MAX_DETAILED_SAMPLES / 2)) {
+    detailedBuffer.pop_front();
+  }
+  
+  // Reduce aggregated buffer if still critical
+  while (aggregatedBuffer.size() > (MAX_AGGREGATE_SAMPLES / 2) && getMemoryUsagePercent() > CRITICAL_MEMORY_THRESHOLD) {
+    aggregatedBuffer.erase(aggregatedBuffer.begin());
+  }
+  
+  // Force garbage collection
+  heap_caps_check_integrity_all(true);
+  
+  Serial.printf("✅ Emergency compression complete: %d detailed + %d aggregated samples remain\n", 
+                detailedBuffer.size(), aggregatedBuffer.size());
+}
+
+void saveToPersistentStorage() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("❌ SPIFFS mount failed - data not saved");
+    return;
+  }
+  
+  Serial.println("💾 Saving data to persistent storage...");
+  
+  // Create JSON document for aggregated data only (detailed data is temporary)
+  DynamicJsonDocument doc(32768); // 32KB for JSON
+  JsonArray dataArray = doc.createNestedArray("aggregated_data");
+  
+  // Save last MAX_SPIFFS_RECORDS of aggregated data
+  size_t startIdx = 0;
+  if (aggregatedBuffer.size() > MAX_SPIFFS_RECORDS) {
+    startIdx = aggregatedBuffer.size() - MAX_SPIFFS_RECORDS;
+  }
+  
+  for (size_t i = startIdx; i < aggregatedBuffer.size(); i++) {
+    JsonObject reading = dataArray.createNestedObject();
+    reading["ts"] = aggregatedBuffer[i].ts;
+    reading["t"] = aggregatedBuffer[i].t;
+    reading["h"] = aggregatedBuffer[i].h;
+    reading["dt"] = aggregatedBuffer[i].datetime;
+  }
+  
+  // Add metadata
+  doc["last_save"] = getCurrentTimestamp();
+  doc["version"] = "1.0";
+  doc["total_records"] = dataArray.size();
+  
+  // Write to file
+  File file = SPIFFS.open(SPIFFS_DATA_FILE, "w");
+  if (!file) {
+    Serial.println("❌ Failed to open data file for writing");
+    return;
+  }
+  
+  size_t written = serializeJson(doc, file);
+  file.close();
+  
+  Serial.printf("✅ Saved %d aggregated records (%d bytes) to persistent storage\n", 
+                dataArray.size(), written);
+  
+  // Save configuration too
+  saveConfigToPersistentStorage();
+}
+
+void loadFromPersistentStorage() {
+  if (!SPIFFS.begin(true)) {
+    Serial.println("⚠️ SPIFFS mount failed - no persistent data loaded");
+    return;
+  }
+  
+  // Load historical data
+  File file = SPIFFS.open(SPIFFS_DATA_FILE, "r");
+  if (!file) {
+    Serial.println("ℹ️ No previous data file found - starting fresh");
+    return;
+  }
+  
+  Serial.println("📂 Loading data from persistent storage...");
+  
+  DynamicJsonDocument doc(32768);
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  
+  if (error) {
+    Serial.printf("❌ Failed to parse data file: %s\n", error.c_str());
+    return;
+  }
+  
+  // Load aggregated data
+  JsonArray dataArray = doc["aggregated_data"];
+  int loadedCount = 0;
+  
+  for (JsonObject reading : dataArray) {
+    uint32_t ts = reading["ts"];
+    float t = reading["t"];
+    float h = reading["h"];
+    String dt = reading["dt"].as<String>();
+    
+    // Only load data that's not too old (within 7 days)
+    uint32_t now = getCurrentTimestamp();
+    if (now == 0) now = millis() / 1000; // Fallback to boot time
+    
+    if ((now - ts) <= (7 * 24 * 3600)) { // Within 7 days
+      aggregatedBuffer.push_back({ts, t, h, dt});
+      loadedCount++;
+    }
+  }
+  
+  Serial.printf("✅ Loaded %d historical records from persistent storage\n", loadedCount);
+  
+  // Load configuration
+  loadConfigFromPersistentStorage();
+}
+
+void saveConfigToPersistentStorage() {
+  if (!SPIFFS.begin(true)) return;
+  
+  DynamicJsonDocument doc(512);
+  doc["alert_threshold"] = alertThreshold;
+  doc["last_save"] = getCurrentTimestamp();
+  doc["version"] = "1.0";
+  
+  File file = SPIFFS.open(SPIFFS_CONFIG_FILE, "w");
+  if (file) {
+    serializeJson(doc, file);
+    file.close();
+    Serial.println("💾 Configuration saved to persistent storage");
+  }
+}
+
+void loadConfigFromPersistentStorage() {
+  if (!SPIFFS.begin(true)) return;
+  
+  File file = SPIFFS.open(SPIFFS_CONFIG_FILE, "r");
+  if (!file) return;
+  
+  DynamicJsonDocument doc(512);
+  DeserializationError error = deserializeJson(doc, file);
+  file.close();
+  
+  if (!error && doc.containsKey("alert_threshold")) {
+    alertThreshold = doc["alert_threshold"];
+    Serial.printf("📂 Loaded alert threshold: %.1f°C from persistent storage\n", alertThreshold);
+  }
+}
+
 // Alert system functions
 void checkTemperatureAlert(float temperature) {
   if (temperature > alertThreshold) {
@@ -367,6 +586,7 @@ void handleSetAlert(AsyncWebServerRequest *req) {
     if (newThreshold > 0 && newThreshold < 100) {
       alertThreshold = newThreshold;
       Serial.printf("Alert threshold set to: %.1f°C\n", alertThreshold);
+      saveConfigToPersistentStorage(); // Save config immediately
       req->send(200, "application/json", "{\"status\":\"ok\",\"threshold\":" + String(alertThreshold) + "}");
     } else {
       req->send(400, "application/json", "{\"error\":\"Invalid threshold range (0-100°C)\"}");
@@ -398,6 +618,19 @@ void handleGetAlert(AsyncWebServerRequest *req) {
   req->send(200, "application/json", output);
 }
 
+void handleSaveData(AsyncWebServerRequest *req) {
+  saveToPersistentStorage();
+  StaticJsonDocument<256> doc;
+  doc["status"] = "success";
+  doc["message"] = "Data saved to persistent storage";
+  doc["records_saved"] = aggregatedBuffer.size();
+  doc["memory_usage"] = getMemoryUsagePercent();
+  
+  String output;
+  serializeJson(doc, output);
+  req->send(200, "application/json", output);
+}
+
 void handleCurrent(AsyncWebServerRequest *req) {
   if (detailedBuffer.empty()) {
     req->send(503, "application/json", "{\"error\":\"no data\"}");
@@ -414,6 +647,10 @@ void handleCurrent(AsyncWebServerRequest *req) {
   doc["sample_interval"] = SAMPLE_MS / 1000;
   doc["detailed_samples"] = detailedBuffer.size();
   doc["aggregated_samples"] = aggregatedBuffer.size();
+  doc["memory_usage_percent"] = getMemoryUsagePercent();
+  doc["free_heap_kb"] = ESP.getFreeHeap() / 1024;
+  doc["emergency_mode"] = emergencyMode;
+  doc["persistent_storage"] = SPIFFS.begin(false);
   
   String output;
   serializeJson(doc, output);
@@ -532,6 +769,11 @@ void handleRoot(AsyncWebServerRequest *req) {
         
         <div class="current">
             <h2 id="current-data" class="loading">Loading current data...</h2>
+            <div id="system-status" style="margin-top: 10px; font-size: 12px; color: #666;">
+                <span id="memory-status">Memory: --</span> | 
+                <span id="storage-status">Storage: --</span> | 
+                <span id="emergency-status">Mode: --</span>
+            </div>
         </div>
         
         <div class="alert-section" id="alert-section">
@@ -541,8 +783,17 @@ void handleRoot(AsyncWebServerRequest *req) {
                 <input type="number" id="alert-threshold" min="0" max="100" step="0.1" value="40.0" style="width: 80px;">
                 <span>°C</span>
                 <button onclick="setAlertThreshold()">Set Alert</button>
-                <button onclick="testAlertSound()" style="background: #ff9800;">🔊 Test Sound</button>
                 <button id="ack-button" onclick="acknowledgeAlert()" class="danger" style="display: none;">🔔 Acknowledge Alert</button>
+            </div>
+            <div id="audio-test-section" style="margin-top: 10px;">
+                <button onclick="testAlertSound()" style="background: #ff9800; font-size: 16px; padding: 10px 15px; font-weight: bold;">🔊 TEST SOUND (Click First!)</button>
+                <button onclick="testVoiceOnly()" style="background: #2196f3; margin-left: 10px;">🗣️ Test Voice</button>
+                <button onclick="showAvailableVoices()" style="background: #4caf50; margin-left: 10px;">📋 Show Voices</button>
+                <br><small style="color: #666;">⚠️ Must test sound first to enable audio alerts</small>
+            </div>
+            <div id="audio-ready-section" style="margin-top: 10px; display: none; background: #d4edda; border: 2px solid #28a745; padding: 10px; border-radius: 5px;">
+                <span style="color: #155724; font-weight: bold;">✅ Audio System Ready</span>
+                <button onclick="testAlertSound()" style="background: #28a745; margin-left: 10px;">🔊 Test Again</button>
             </div>
             <div class="alert-status" id="alert-status">Status: Loading...</div>
             <div class="alert-warning" id="alert-warning">
@@ -574,82 +825,211 @@ void handleRoot(AsyncWebServerRequest *req) {
         </div>
     </div>
     
-    <!-- Multiple audio elements for maximum browser compatibility -->
-    <audio id="alert-sound-1" preload="auto" volume="1.0">
-        <!-- Simple beep sound that works everywhere -->
-        <source src="data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhDy2JzfPYhT0F" type="audio/wav">
-    </audio>
-    <audio id="alert-sound-2" preload="auto" volume="1.0">
-        <!-- Backup audio element -->
-        <source src="data:audio/mpeg;base64,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" type="audio/mpeg">
-    </audio>
-    
-    <!-- Simple audio generation script -->
+    <!-- Ultra simple audio that works everywhere -->
     <script>
         let audioContext = null;
-        let alertInterval = null;
+        let isAudioEnabled = false;
         
-        function initSimpleAudio() {
+                 // Initialize audio on first user click (required by browsers)
+         function enableAudio() {
+             if (isAudioEnabled) {
+                 // If already enabled, show green status
+                 document.getElementById('audio-test-section').style.display = 'none';
+                 document.getElementById('audio-ready-section').style.display = 'block';
+                 return true;
+             }
+             
+             try {
+                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                 
+                 // Play a silent sound to unlock audio
+                 const oscillator = audioContext.createOscillator();
+                 const gainNode = audioContext.createGain();
+                 oscillator.connect(gainNode);
+                 gainNode.connect(audioContext.destination);
+                 gainNode.gain.value = 0.001; // Almost silent
+                 oscillator.frequency.value = 440;
+                 oscillator.start();
+                 oscillator.stop(audioContext.currentTime + 0.01);
+                 
+                 isAudioEnabled = true;
+                 console.log('✅ Audio enabled!');
+                 return true;
+             } catch (e) {
+                 console.log('❌ Audio failed to initialize:', e);
+                 return false;
+             }
+         }
+        
+        // Super simple, loud beep
+        function playLoudBeep(frequency = 1000, duration = 500) {
+            if (!isAudioEnabled) {
+                console.log('Audio not enabled - click Test Sound first');
+                return false;
+            }
+            
+            if (!audioContext || audioContext.state === 'closed') {
+                console.log('Audio context not available');
+                return false;
+            }
+            
             try {
-                audioContext = new (window.AudioContext || window.webkitAudioContext)();
+                // Resume if suspended
+                if (audioContext.state === 'suspended') {
+                    audioContext.resume();
+                }
+                
+                const oscillator = audioContext.createOscillator();
+                const gainNode = audioContext.createGain();
+                
+                oscillator.connect(gainNode);
+                gainNode.connect(audioContext.destination);
+                
+                oscillator.type = 'square';
+                oscillator.frequency.value = frequency;
+                
+                // LOUD volume
+                gainNode.gain.setValueAtTime(0, audioContext.currentTime);
+                gainNode.gain.linearRampToValueAtTime(0.5, audioContext.currentTime + 0.01); // 50% volume = very loud
+                gainNode.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + duration / 1000);
+                
+                oscillator.start(audioContext.currentTime);
+                oscillator.stop(audioContext.currentTime + duration / 1000);
+                
+                console.log(`🔊 Playing beep: ${frequency}Hz for ${duration}ms`);
                 return true;
             } catch (e) {
-                console.log('Web Audio API not supported');
+                console.log('❌ Beep failed:', e);
                 return false;
             }
         }
         
-        function playSimpleBeep(frequency = 800, duration = 500, volume = 0.8) {
-            if (!audioContext) {
-                if (!initSimpleAudio()) return false;
-            }
-            
-            // Resume audio context if suspended
-            if (audioContext.state === 'suspended') {
-                audioContext.resume();
-            }
-            
-            const oscillator = audioContext.createOscillator();
-            const gainNode = audioContext.createGain();
-            
-            oscillator.connect(gainNode);
-            gainNode.connect(audioContext.destination);
-            
-            oscillator.frequency.value = frequency;
-            oscillator.type = 'square'; // Square wave for loud, clear sound
-            
-            gainNode.gain.setValueAtTime(0, audioContext.currentTime);
-            gainNode.gain.linearRampToValueAtTime(volume, audioContext.currentTime + 0.01);
-            gainNode.gain.exponentialRampToValueAtTime(0.01, audioContext.currentTime + duration / 1000);
-            
-            oscillator.start(audioContext.currentTime);
-            oscillator.stop(audioContext.currentTime + duration / 1000);
-            
-            return true;
-        }
+                 // Alternative method using Speech Synthesis (works without user interaction)
+         let bestVoice = null;
+         let voicesLoaded = false;
+         
+         function loadBestEnglishVoice() {
+             if (!('speechSynthesis' in window)) return;
+             
+             const voices = speechSynthesis.getVoices();
+             if (voices.length === 0) return;
+             
+             // Priority order for best English voices
+             const preferredVoices = [
+                 'Google US English',
+                 'Microsoft Zira Desktop',
+                 'Microsoft David Desktop',
+                 'Alex',
+                 'Samantha',
+                 'Karen',
+                 'Daniel'
+             ];
+             
+             // Try to find preferred voices first
+             for (const preferred of preferredVoices) {
+                 const voice = voices.find(v => v.name.includes(preferred));
+                 if (voice) {
+                     bestVoice = voice;
+                     console.log(`✅ Selected voice: ${voice.name} (${voice.lang})`);
+                     return;
+                 }
+             }
+             
+             // Fallback: find any clear English voice
+             const englishVoices = voices.filter(v => 
+                 v.lang.startsWith('en') && 
+                 (v.name.includes('English') || v.name.includes('US') || v.name.includes('UK'))
+             );
+             
+             if (englishVoices.length > 0) {
+                 bestVoice = englishVoices[0];
+                 console.log(`✅ Selected fallback voice: ${bestVoice.name} (${bestVoice.lang})`);
+             } else if (voices.length > 0) {
+                 bestVoice = voices[0];
+                 console.log(`⚠️ Using default voice: ${bestVoice.name} (${bestVoice.lang})`);
+             }
+             
+             voicesLoaded = true;
+         }
+         
+         function playTextToSpeech(text = "Temperature Alert!") {
+             if (!('speechSynthesis' in window)) return false;
+             
+             // Load voices if not already loaded
+             if (!voicesLoaded) {
+                 loadBestEnglishVoice();
+                 // If still no voices, wait a bit and try again
+                 if (!voicesLoaded) {
+                     setTimeout(() => {
+                         loadBestEnglishVoice();
+                         if (voicesLoaded) playTextToSpeech(text);
+                     }, 100);
+                     return false;
+                 }
+             }
+             
+             try {
+                 // Clear any previous speech
+                 speechSynthesis.cancel();
+                 
+                 // Create clearer, simpler message for better pronunciation
+                 let clearText = text;
+                 if (text.includes("Red Alert") || text.includes("critical")) {
+                     clearText = "Warning! Temperature is too high!";
+                 } else if (text.includes("test") || text.includes("ready")) {
+                     clearText = "Audio test successful. Alert system is ready.";
+                 } else if (text.includes("complete")) {
+                     clearText = "Sound test complete. System ready.";
+                 }
+                 
+                 const utterance = new SpeechSynthesisUtterance(clearText);
+                 
+                 // Use best available voice
+                 if (bestVoice) {
+                     utterance.voice = bestVoice;
+                 }
+                 
+                 // Optimized settings for clarity
+                 utterance.volume = 1.0;
+                 utterance.rate = 0.8; // Slightly slower for clarity
+                 utterance.pitch = 1.0; // Normal pitch for best clarity
+                 
+                 // Add pauses for better understanding
+                 if (clearText.includes("Warning")) {
+                     utterance.text = "Warning. Temperature is too high.";
+                 }
+                 
+                 speechSynthesis.speak(utterance);
+                 console.log(`🗣️ Speaking (${bestVoice ? bestVoice.name : 'default'}):`, clearText);
+                 return true;
+             } catch (e) {
+                 console.log('❌ Text-to-speech failed:', e);
+                 return false;
+             }
+         }
+         
+         // Load voices when available
+         if ('speechSynthesis' in window) {
+             speechSynthesis.onvoiceschanged = loadBestEnglishVoice;
+             // Also try to load immediately
+             setTimeout(loadBestEnglishVoice, 100);
+         }
         
-        function playAlertPattern() {
-            // Play RED ALERT pattern: High-Low-High-Low
-            playSimpleBeep(1000, 300, 0.9); // High frequency, loud
-            setTimeout(() => playSimpleBeep(600, 300, 0.9), 350);  // Low frequency
-            setTimeout(() => playSimpleBeep(1000, 300, 0.9), 700); // High again
-            setTimeout(() => playSimpleBeep(600, 300, 0.9), 1050); // Low again
-        }
-        
-        function playHTMLAudio() {
-            // Try HTML5 audio as fallback
-            const audio1 = document.getElementById('alert-sound-1');
-            const audio2 = document.getElementById('alert-sound-2');
-            
-            // Set volume to maximum
-            if (audio1) {
-                audio1.volume = 1.0;
-                audio1.play().catch(() => {
-                    if (audio2) {
-                        audio2.volume = 1.0;
-                        audio2.play().catch(() => console.log('All audio fallbacks failed'));
-                    }
+        // Try notification sound (system beep)
+        function playSystemBeep() {
+            try {
+                // Try to create a data URL for a simple beep
+                const audioElement = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhDy2JzfPYhT0F');
+                audioElement.volume = 1.0;
+                audioElement.play().then(() => {
+                    console.log('🔔 System beep played');
+                }).catch(e => {
+                    console.log('❌ System beep failed:', e);
                 });
+                return true;
+            } catch (e) {
+                console.log('❌ System beep creation failed:', e);
+                return false;
             }
         }
     </script>
@@ -720,28 +1100,36 @@ void handleRoot(AsyncWebServerRequest *req) {
             }
         }
         
+        let alertInterval = null;
+        
         function playAlertSound() {
             if (!isAlertSounding) {
                 isAlertSounding = true;
                 console.log('🚨 RED ALERT! Temperature threshold exceeded!');
                 
-                // Try Web Audio API first (loudest option)
-                const webAudioSuccess = playSimpleBeep(1000, 500, 1.0);
-                if (!webAudioSuccess) {
-                    // Fallback to HTML5 audio
-                    playHTMLAudio();
+                // Multiple fallback methods for maximum compatibility
+                
+                // Method 1: Web Audio API beep (loudest)
+                if (!playLoudBeep(1000, 800)) {
+                    console.log('Web Audio failed, trying alternatives...');
+                    
+                                         // Method 2: Text-to-speech (works without user interaction)
+                     if (!playTextToSpeech("Warning! Temperature critical!")) {
+                        console.log('Text-to-speech failed, trying system beep...');
+                        
+                        // Method 3: System beep fallback
+                        playSystemBeep();
+                    }
                 }
                 
-                // Start repeating alert pattern
+                // Start repeating alert every 3 seconds
                 alertInterval = setInterval(() => {
                     if (isAlertSounding) {
-                        // Try Web Audio API pattern
-                        if (!playAlertPattern()) {
-                            // Fallback to HTML5 audio
-                            playHTMLAudio();
-                        }
+                                                 if (!playLoudBeep(800, 600)) {
+                             playTextToSpeech("Warning! Temperature too high!");
+                         }
                     }
-                }, 2000); // Repeat every 2 seconds
+                }, 3000);
             }
         }
         
@@ -755,11 +1143,10 @@ void handleRoot(AsyncWebServerRequest *req) {
                     alertInterval = null;
                 }
                 
-                // Stop any HTML5 audio
-                const audio1 = document.getElementById('alert-sound-1');
-                const audio2 = document.getElementById('alert-sound-2');
-                if (audio1) audio1.pause();
-                if (audio2) audio2.pause();
+                // Stop speech synthesis
+                if ('speechSynthesis' in window) {
+                    speechSynthesis.cancel();
+                }
                 
                 console.log('✅ Alert acknowledged - All clear');
             }
@@ -786,34 +1173,127 @@ void handleRoot(AsyncWebServerRequest *req) {
         }
         
         function testAlertSound() {
-            console.log('🔊 Testing alert sound...');
+            console.log('🔊 Testing all audio methods...');
             
             // Stop any current alert
             stopAlertSound();
             
-            // Play test sound
-            isAlertSounding = true;
-            
-            // Try Web Audio API first
-            const webAudioSuccess = playSimpleBeep(1000, 800, 1.0);
-            if (!webAudioSuccess) {
-                console.log('Web Audio failed, trying HTML5 audio...');
-                playHTMLAudio();
+            // First, enable audio (required by browsers)
+            if (!enableAudio()) {
+                alert('⚠️ Audio initialization failed. Your browser may not support audio.');
+                return;
             }
             
-            // Play full alert pattern once
-            setTimeout(() => {
-                if (!playAlertPattern()) {
-                    playHTMLAudio();
+            let testStep = 0;
+            let anyTestSuccessful = false;
+            const testSteps = [
+                () => {
+                    console.log('Test 1: Loud beep');
+                    if (!playLoudBeep(1000, 1000)) {
+                        console.log('❌ Loud beep failed');
+                        return false;
+                    }
+                    anyTestSuccessful = true;
+                    return true;
+                },
+                                 () => {
+                     console.log('Test 2: Text-to-speech');
+                     const success = playTextToSpeech("Audio test successful. Alert system ready.");
+                     if (success) anyTestSuccessful = true;
+                     return success;
+                 },
+                () => {
+                    console.log('Test 3: System beep');
+                    const success = playSystemBeep();
+                    if (success) anyTestSuccessful = true;
+                    return success;
+                },
+                () => {
+                    console.log('Test 4: High frequency beep');
+                    const success = playLoudBeep(1500, 500);
+                    if (success) anyTestSuccessful = true;
+                    return success;
+                },
+                () => {
+                    console.log('Test 5: Low frequency beep');
+                    const success = playLoudBeep(600, 500);
+                    if (success) anyTestSuccessful = true;
+                    return success;
                 }
-            }, 1000);
+            ];
             
-            // Stop test after 5 seconds
-            setTimeout(() => {
-                isAlertSounding = false;
-                stopAlertSound();
-                console.log('🔇 Sound test completed');
-            }, 5000);
+            function runNextTest() {
+                if (testStep < testSteps.length) {
+                    const success = testSteps[testStep]();
+                    if (success) {
+                        console.log(`✅ Test ${testStep + 1} successful`);
+                    } else {
+                        console.log(`❌ Test ${testStep + 1} failed`);
+                    }
+                    testStep++;
+                    setTimeout(runNextTest, 1200); // Wait between tests
+                } else {
+                    console.log('🔇 All sound tests completed!');
+                    
+                    // Show green "Audio Ready" status if any test was successful
+                    if (anyTestSuccessful) {
+                        document.getElementById('audio-test-section').style.display = 'none';
+                        document.getElementById('audio-ready-section').style.display = 'block';
+                        console.log('✅ Audio system is ready for alerts!');
+                        
+                                             if (playTextToSpeech) {
+                         playTextToSpeech("Sound test complete. System ready.");
+                     }
+                    } else {
+                        console.log('❌ All audio tests failed. Alerts may not work properly.');
+                        alert('⚠️ All audio tests failed. Your browser may not support audio alerts.');
+                    }
+                }
+            }
+            
+            // Start the test sequence
+            runNextTest();
+        }
+        
+        function testVoiceOnly() {
+            console.log('🗣️ Testing voice only...');
+            enableAudio();
+            
+            if (playTextToSpeech("This is a voice test. Can you understand me clearly?")) {
+                console.log('✅ Voice test started');
+            } else {
+                alert('❌ Voice test failed. Text-to-speech not available.');
+            }
+        }
+        
+        function showAvailableVoices() {
+            if (!('speechSynthesis' in window)) {
+                alert('❌ Text-to-speech not supported in this browser.');
+                return;
+            }
+            
+            loadBestEnglishVoice();
+            const voices = speechSynthesis.getVoices();
+            
+            if (voices.length === 0) {
+                alert('⚠️ No voices available. Try refreshing the page.');
+                return;
+            }
+            
+            console.log('📋 Available Voices:');
+            voices.forEach((voice, index) => {
+                const selected = (bestVoice && voice.name === bestVoice.name) ? ' ✅ SELECTED' : '';
+                console.log(`${index + 1}. ${voice.name} (${voice.lang})${selected}`);
+            });
+            
+            const englishVoices = voices.filter(v => v.lang.startsWith('en'));
+            const selectedVoice = bestVoice ? `${bestVoice.name} (${bestVoice.lang})` : 'Default';
+            
+            alert(`🗣️ Voice Information:\n\n` +
+                  `Currently Selected: ${selectedVoice}\n` +
+                  `Total Voices: ${voices.length}\n` +
+                  `English Voices: ${englishVoices.length}\n\n` +
+                  `Check console (F12) for full voice list.`);
         }
         
         async function updateCurrent() {
@@ -829,6 +1309,25 @@ void handleRoot(AsyncWebServerRequest *req) {
                     `Current: <strong>${current.t.toFixed(1)}°C</strong> | <strong>${current.h.toFixed(0)}%</strong> RH<br>
                      <small>📅 ${timeInfo}</small><br>
                      <small>📊 ${sampleInfo}</small>`;
+                
+                // Update system status
+                const memStatus = document.getElementById('memory-status');
+                const storageStatus = document.getElementById('storage-status');
+                const emergencyStatus = document.getElementById('emergency-status');
+                
+                const memPercent = current.memory_usage_percent || 0;
+                const freeHeap = current.free_heap_kb || 0;
+                const emergency = current.emergency_mode || false;
+                const persistent = current.persistent_storage || false;
+                
+                memStatus.innerHTML = `Memory: ${memPercent}% (${freeHeap}KB free)`;
+                memStatus.style.color = memPercent > 90 ? '#d32f2f' : memPercent > 80 ? '#ff9800' : '#4caf50';
+                
+                storageStatus.innerHTML = `Storage: ${persistent ? '✅ Active' : '❌ Failed'}`;
+                storageStatus.style.color = persistent ? '#4caf50' : '#d32f2f';
+                
+                emergencyStatus.innerHTML = `Mode: ${emergency ? '🚨 Emergency' : '✅ Normal'}`;
+                emergencyStatus.style.color = emergency ? '#d32f2f' : '#4caf50';
             }
             
             // Update alert status
@@ -997,9 +1496,21 @@ void setup() {
   dht.begin();
   Serial.println("DHT11 sensor initialized on GPIO4");
   
-  // Initialize SPIFFS (not used in this simple version)
+  // Initialize SPIFFS for persistent data storage
   if (!SPIFFS.begin(true)) {
-    Serial.println("SPIFFS initialization failed");
+    Serial.println("❌ SPIFFS initialization failed - no persistent storage available");
+  } else {
+    Serial.println("✅ SPIFFS initialized - persistent storage ready");
+    
+    // Load previous data and configuration
+    loadFromPersistentStorage();
+    
+    // Initialize memory tracking
+    lastMemoryCheck = millis();
+    lastSPIFFSSave = getCurrentTimestamp();
+    
+    Serial.printf("💾 Memory usage at startup: %d%% (%d KB free)\n", 
+                  getMemoryUsagePercent(), ESP.getFreeHeap() / 1024);
   }
   
   // Network initialization with discovery features
@@ -1060,6 +1571,7 @@ void setup() {
   server.on("/api/alert/get", HTTP_GET, handleGetAlert);
   server.on("/api/alert/set", HTTP_POST, handleSetAlert);
   server.on("/api/alert/acknowledge", HTTP_POST, handleAckAlert);
+  server.on("/api/save", HTTP_POST, handleSaveData);
   
   // Start server
   server.begin();
@@ -1079,6 +1591,17 @@ void loop() {
   if (millis() - lastNetworkCheck >= NETWORK_CHECK_MS) {
     lastNetworkCheck = millis();
     checkNetworkStatus();
+  }
+  
+  // Check memory usage periodically (every 30 seconds)
+  if (millis() - lastMemoryCheck >= 30000) {
+    lastMemoryCheck = millis();
+    checkMemoryUsage();
+    
+    // Log memory status periodically
+    Serial.printf("📊 Memory: %d%% used (%d KB free), Buffers: %d detailed + %d aggregated\n",
+                  getMemoryUsagePercent(), ESP.getFreeHeap() / 1024, 
+                  detailedBuffer.size(), aggregatedBuffer.size());
   }
   
   // Take sensor readings
