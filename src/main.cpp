@@ -123,23 +123,23 @@ void setupNTP() {
     } else {
       configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET_SEC, NTP_SERVERS[0]);
     }
-    
-    // Wait for time to be set
+  
+  // Wait for time to be set
     Serial.print("Waiting for NTP sync");
-    int timeout = 0;
+  int timeout = 0;
     while (!time(nullptr) && timeout < 15) {
-      delay(1000);
-      Serial.print(".");
-      timeout++;
-    }
-    
-    if (time(nullptr)) {
+    delay(1000);
+    Serial.print(".");
+    timeout++;
+  }
+  
+  if (time(nullptr)) {
       timeSet = true;
       Serial.println("\n✅ NTP time synchronized!");
-      Serial.printf("Current time: %s\n", getCurrentDateTime().c_str());
+    Serial.printf("Current time: %s\n", getCurrentDateTime().c_str());
       Serial.printf("Timezone: UTC%+d (DST: %+d)\n", 
                    GMT_OFFSET_SEC/3600, DAYLIGHT_OFFSET_SEC/3600);
-    } else {
+  } else {
       Serial.println("\n⚠️ NTP sync failed, trying next attempt...");
       delay(2000);
     }
@@ -285,8 +285,9 @@ void addReading(float t, float h) {
   Serial.printf("✅ Reading [%s]: %.1f°C, %.0f%% RH (detailed: %d samples)\n", 
                 datetime.c_str(), t, h, detailedBuffer.size());
   
-  // Check for temperature alerts
+  // Check for temperature and humidity alerts
   checkTemperatureAlert(t);
+  checkHumidityAlert(h);
   
   // Check memory usage every reading
   checkMemoryUsage();
@@ -514,7 +515,7 @@ void loadFromPersistentStorage() {
     String dt = reading["dt"].as<String>();
     
     // Only load data that's not too old (within 7 days)
-    uint32_t now = getCurrentTimestamp();
+  uint32_t now = getCurrentTimestamp();
     if (now == 0) now = millis() / 1000; // Fallback to boot time
     
     if ((now - ts) <= (7 * 24 * 3600)) { // Within 7 days
@@ -534,6 +535,7 @@ void saveConfigToPersistentStorage() {
   
   DynamicJsonDocument doc(512);
   doc["alert_threshold"] = alertThreshold;
+  doc["humidity_alert_threshold"] = humidityAlertThreshold;
   doc["last_save"] = getCurrentTimestamp();
   doc["version"] = "1.0";
   
@@ -555,9 +557,15 @@ void loadConfigFromPersistentStorage() {
   DeserializationError error = deserializeJson(doc, file);
   file.close();
   
-  if (!error && doc.containsKey("alert_threshold")) {
-    alertThreshold = doc["alert_threshold"];
-    Serial.printf("📂 Loaded alert threshold: %.1f°C from persistent storage\n", alertThreshold);
+  if (!error) {
+    if (doc.containsKey("alert_threshold")) {
+      alertThreshold = doc["alert_threshold"];
+      Serial.printf("📂 Loaded temperature alert threshold: %.1f°C from persistent storage\n", alertThreshold);
+    }
+    if (doc.containsKey("humidity_alert_threshold")) {
+      humidityAlertThreshold = doc["humidity_alert_threshold"];
+      Serial.printf("📂 Loaded humidity alert threshold: %.1f%% from persistent storage\n", humidityAlertThreshold);
+    }
   }
 }
 
@@ -570,14 +578,22 @@ void checkTemperatureAlert(float temperature) {
       alertAcknowledged = false;
       Serial.printf("TEMPERATURE ALERT! Current: %.1f°C, Threshold: %.1f°C\n", temperature, alertThreshold);
     }
-  } else {
-    // Temperature is below threshold
-    if (alertActive) {
-      alertActive = false;
-      alertAcknowledged = true;
-      Serial.println("Temperature alert cleared - back to normal");
+  }
+  // Remove the automatic clearing - alert stays active until acknowledged
+  // Only check for new alerts if no alert is currently active
+}
+
+void checkHumidityAlert(float humidity) {
+  if (humidity > humidityAlertThreshold) {
+    if (!humidityAlertActive) {
+      // New humidity alert triggered
+      humidityAlertActive = true;
+      humidityAlertAcknowledged = false;
+      Serial.printf("HUMIDITY ALERT! Current: %.1f%%, Threshold: %.1f%%\n", humidity, humidityAlertThreshold);
     }
   }
+  // Remove the automatic clearing - alert stays active until acknowledged
+  // Only check for new alerts if no alert is currently active
 }
 
 void handleSetAlert(AsyncWebServerRequest *req) {
@@ -585,7 +601,7 @@ void handleSetAlert(AsyncWebServerRequest *req) {
     float newThreshold = req->getParam("threshold")->value().toFloat();
     if (newThreshold > 0 && newThreshold < 100) {
       alertThreshold = newThreshold;
-      Serial.printf("Alert threshold set to: %.1f°C\n", alertThreshold);
+      Serial.printf("Temperature alert threshold set to: %.1f°C\n", alertThreshold);
       saveConfigToPersistentStorage(); // Save config immediately
       req->send(200, "application/json", "{\"status\":\"ok\",\"threshold\":" + String(alertThreshold) + "}");
     } else {
@@ -596,10 +612,38 @@ void handleSetAlert(AsyncWebServerRequest *req) {
   }
 }
 
+void handleSetHumidityAlert(AsyncWebServerRequest *req) {
+  if (req->hasParam("threshold")) {
+    float newThreshold = req->getParam("threshold")->value().toFloat();
+    if (newThreshold > 0 && newThreshold <= 100) {
+      humidityAlertThreshold = newThreshold;
+      Serial.printf("Humidity alert threshold set to: %.1f%%\n", humidityAlertThreshold);
+      saveConfigToPersistentStorage(); // Save config immediately
+      req->send(200, "application/json", "{\"status\":\"ok\",\"threshold\":" + String(humidityAlertThreshold) + "}");
+    } else {
+      req->send(400, "application/json", "{\"error\":\"Invalid threshold range (0-100%)\"}");
+    }
+  } else {
+    req->send(400, "application/json", "{\"error\":\"Missing threshold parameter\"}");
+  }
+}
+
 void handleAckAlert(AsyncWebServerRequest *req) {
   if (alertActive) {
+    alertActive = false;
     alertAcknowledged = true;
-    Serial.println("Temperature alert acknowledged by user");
+    Serial.println("Temperature alert acknowledged by user - alert cleared");
+    req->send(200, "application/json", "{\"status\":\"acknowledged\"}");
+  } else {
+    req->send(200, "application/json", "{\"status\":\"no_active_alert\"}");
+  }
+}
+
+void handleAckHumidityAlert(AsyncWebServerRequest *req) {
+  if (humidityAlertActive) {
+    humidityAlertActive = false;
+    humidityAlertAcknowledged = true;
+    Serial.println("Humidity alert acknowledged by user - alert cleared");
     req->send(200, "application/json", "{\"status\":\"acknowledged\"}");
   } else {
     req->send(200, "application/json", "{\"status\":\"no_active_alert\"}");
@@ -612,6 +656,18 @@ void handleGetAlert(AsyncWebServerRequest *req) {
   doc["active"] = alertActive;
   doc["acknowledged"] = alertAcknowledged;
   doc["needs_attention"] = (alertActive && !alertAcknowledged);
+  
+  String output;
+  serializeJson(doc, output);
+  req->send(200, "application/json", output);
+}
+
+void handleGetHumidityAlert(AsyncWebServerRequest *req) {
+  StaticJsonDocument<256> doc;
+  doc["threshold"] = humidityAlertThreshold;
+  doc["active"] = humidityAlertActive;
+  doc["acknowledged"] = humidityAlertAcknowledged;
+  doc["needs_attention"] = (humidityAlertActive && !humidityAlertAcknowledged);
   
   String output;
   serializeJson(doc, output);
@@ -651,6 +707,7 @@ void handleCurrent(AsyncWebServerRequest *req) {
   doc["free_heap_kb"] = ESP.getFreeHeap() / 1024;
   doc["emergency_mode"] = emergencyMode;
   doc["persistent_storage"] = SPIFFS.begin(false);
+  doc["uptime_seconds"] = millis() / 1000;  // Add actual uptime in seconds since boot
   
   String output;
   serializeJson(doc, output);
@@ -726,762 +783,8 @@ void handleHistory(AsyncWebServerRequest *req) {
 }
 
 void handleRoot(AsyncWebServerRequest *req) {
-  String html = R"rawliteral(
-<!DOCTYPE html>
-<html>
-<head>
-    <meta charset="utf-8">
-    <title>ESP32 Temperature & Humidity Monitor</title>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-        body { font-family: Arial, sans-serif; margin: 20px; background: #f0f0f0; }
-        .container { max-width: 1200px; margin: 0 auto; background: white; padding: 20px; border-radius: 10px; }
-        .current { background: #e8f4fd; padding: 15px; border-radius: 8px; margin-bottom: 20px; }
-        .alert-section { background: #f8f9fa; padding: 15px; border-radius: 8px; margin-bottom: 20px; border: 2px solid #dee2e6; }
-        .alert-active { background: #f8d7da !important; border-color: #dc3545 !important; }
-        .alert-controls { display: flex; gap: 10px; align-items: center; margin-bottom: 10px; }
-        .alert-status { font-weight: bold; }
-        .alert-warning { background: #ffebee; color: #d32f2f; padding: 10px; border-radius: 5px; margin-top: 10px; display: none; }
-        .alert-warning.show { display: block; animation: redAlert 1s infinite; }
-        .charts { display: grid; grid-template-columns: 1fr 1fr; gap: 20px; margin-top: 20px; }
-        @keyframes redAlert { 
-            0% { background: #ffebee; } 
-            50% { background: #f44336; color: white; } 
-            100% { background: #ffebee; } 
-        }
-        .chart-container { background: #fafafa; padding: 15px; border-radius: 8px; }
-        select, input, button { padding: 8px; font-size: 14px; margin: 2px; }
-        button { background: #007bff; color: white; border: none; border-radius: 4px; cursor: pointer; }
-        button:hover { background: #0056b3; }
-        button.danger { background: #dc3545; }
-        button.danger:hover { background: #c82333; }
-        canvas { max-height: 300px; }
-        h1 { color: #333; text-align: center; }
-        h2 { color: #666; margin: 0; }
-        .loading { text-align: center; color: #666; }
-        .blink { animation: blink 1s infinite; }
-        @keyframes blink { 0% { opacity: 1; } 50% { opacity: 0.3; } 100% { opacity: 1; } }
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Temperature & Humidity Monitor</h1>
-        
-        <div class="current">
-            <h2 id="current-data" class="loading">Loading current data...</h2>
-            <div id="system-status" style="margin-top: 10px; font-size: 12px; color: #666;">
-                <span id="memory-status">Memory: --</span> | 
-                <span id="storage-status">Storage: --</span> | 
-                <span id="emergency-status">Mode: --</span>
-            </div>
-        </div>
-        
-        <div class="alert-section" id="alert-section">
-            <h3>🌡️ Temperature Alert System</h3>
-            <div class="alert-controls">
-                <label for="alert-threshold">Alert Threshold:</label>
-                <input type="number" id="alert-threshold" min="0" max="100" step="0.1" value="40.0" style="width: 80px;">
-                <span>°C</span>
-                <button onclick="setAlertThreshold()">Set Alert</button>
-                <button id="ack-button" onclick="acknowledgeAlert()" class="danger" style="display: none;">🔔 Acknowledge Alert</button>
-            </div>
-            <div id="audio-test-section" style="margin-top: 10px;">
-                <button onclick="testAlertSound()" style="background: #ff9800; font-size: 16px; padding: 10px 15px; font-weight: bold;">🔊 TEST SOUND (Click First!)</button>
-                <button onclick="testVoiceOnly()" style="background: #2196f3; margin-left: 10px;">🗣️ Test Voice</button>
-                <button onclick="showAvailableVoices()" style="background: #4caf50; margin-left: 10px;">📋 Show Voices</button>
-                <br><small style="color: #666;">⚠️ Must test sound first to enable audio alerts</small>
-            </div>
-            <div id="audio-ready-section" style="margin-top: 10px; display: none; background: #d4edda; border: 2px solid #28a745; padding: 10px; border-radius: 5px;">
-                <span style="color: #155724; font-weight: bold;">✅ Audio System Ready</span>
-                <button onclick="testAlertSound()" style="background: #28a745; margin-left: 10px;">🔊 Test Again</button>
-            </div>
-            <div class="alert-status" id="alert-status">Status: Loading...</div>
-            <div class="alert-warning" id="alert-warning">
-                <strong>🚨 RED ALERT! TEMPERATURE CRITICAL!</strong><br>
-                Environmental systems report thermal threshold exceeded!<br>
-                <em>Recommend immediate attention to environmental controls.</em>
-            </div>
-        </div>
-        
-        <div>
-            <label for="range-select">Data View:</label>
-            <select id="range-select">
-                <option value="detailed">Detailed (30s intervals, last 30 min)</option>
-                <option value="aggregated">Aggregated (5min intervals, ~24h)</option>
-                <option value="all">Combined View (All Available Data)</option>
-            </select>
-            <span id="data-info" style="margin-left: 15px; color: #666; font-size: 12px;"></span>
-        </div>
-        
-        <div class="charts">
-            <div class="chart-container">
-                <h3>Temperature (°C)</h3>
-                <canvas id="temp-chart"></canvas>
-            </div>
-            <div class="chart-container">
-                <h3>Humidity (%)</h3>
-                <canvas id="humidity-chart"></canvas>
-            </div>
-        </div>
-    </div>
-    
-    <!-- Ultra simple audio that works everywhere -->
-    <script>
-        let audioContext = null;
-        let isAudioEnabled = false;
-        
-                 // Initialize audio on first user click (required by browsers)
-         function enableAudio() {
-             if (isAudioEnabled) {
-                 // If already enabled, show green status
-                 document.getElementById('audio-test-section').style.display = 'none';
-                 document.getElementById('audio-ready-section').style.display = 'block';
-                 return true;
-             }
-             
-             try {
-                 audioContext = new (window.AudioContext || window.webkitAudioContext)();
-                 
-                 // Play a silent sound to unlock audio
-                 const oscillator = audioContext.createOscillator();
-                 const gainNode = audioContext.createGain();
-                 oscillator.connect(gainNode);
-                 gainNode.connect(audioContext.destination);
-                 gainNode.gain.value = 0.001; // Almost silent
-                 oscillator.frequency.value = 440;
-                 oscillator.start();
-                 oscillator.stop(audioContext.currentTime + 0.01);
-                 
-                 isAudioEnabled = true;
-                 console.log('✅ Audio enabled!');
-                 return true;
-             } catch (e) {
-                 console.log('❌ Audio failed to initialize:', e);
-                 return false;
-             }
-         }
-        
-        // Super simple, loud beep
-        function playLoudBeep(frequency = 1000, duration = 500) {
-            if (!isAudioEnabled) {
-                console.log('Audio not enabled - click Test Sound first');
-                return false;
-            }
-            
-            if (!audioContext || audioContext.state === 'closed') {
-                console.log('Audio context not available');
-                return false;
-            }
-            
-            try {
-                // Resume if suspended
-                if (audioContext.state === 'suspended') {
-                    audioContext.resume();
-                }
-                
-                const oscillator = audioContext.createOscillator();
-                const gainNode = audioContext.createGain();
-                
-                oscillator.connect(gainNode);
-                gainNode.connect(audioContext.destination);
-                
-                oscillator.type = 'square';
-                oscillator.frequency.value = frequency;
-                
-                // LOUD volume
-                gainNode.gain.setValueAtTime(0, audioContext.currentTime);
-                gainNode.gain.linearRampToValueAtTime(0.5, audioContext.currentTime + 0.01); // 50% volume = very loud
-                gainNode.gain.exponentialRampToValueAtTime(0.001, audioContext.currentTime + duration / 1000);
-                
-                oscillator.start(audioContext.currentTime);
-                oscillator.stop(audioContext.currentTime + duration / 1000);
-                
-                console.log(`🔊 Playing beep: ${frequency}Hz for ${duration}ms`);
-                return true;
-            } catch (e) {
-                console.log('❌ Beep failed:', e);
-                return false;
-            }
-        }
-        
-                 // Alternative method using Speech Synthesis (works without user interaction)
-         let bestVoice = null;
-         let voicesLoaded = false;
-         
-         function loadBestEnglishVoice() {
-             if (!('speechSynthesis' in window)) return;
-             
-             const voices = speechSynthesis.getVoices();
-             if (voices.length === 0) return;
-             
-             // Priority order for best English voices
-             const preferredVoices = [
-                 'Google US English',
-                 'Microsoft Zira Desktop',
-                 'Microsoft David Desktop',
-                 'Alex',
-                 'Samantha',
-                 'Karen',
-                 'Daniel'
-             ];
-             
-             // Try to find preferred voices first
-             for (const preferred of preferredVoices) {
-                 const voice = voices.find(v => v.name.includes(preferred));
-                 if (voice) {
-                     bestVoice = voice;
-                     console.log(`✅ Selected voice: ${voice.name} (${voice.lang})`);
-                     return;
-                 }
-             }
-             
-             // Fallback: find any clear English voice
-             const englishVoices = voices.filter(v => 
-                 v.lang.startsWith('en') && 
-                 (v.name.includes('English') || v.name.includes('US') || v.name.includes('UK'))
-             );
-             
-             if (englishVoices.length > 0) {
-                 bestVoice = englishVoices[0];
-                 console.log(`✅ Selected fallback voice: ${bestVoice.name} (${bestVoice.lang})`);
-             } else if (voices.length > 0) {
-                 bestVoice = voices[0];
-                 console.log(`⚠️ Using default voice: ${bestVoice.name} (${bestVoice.lang})`);
-             }
-             
-             voicesLoaded = true;
-         }
-         
-         function playTextToSpeech(text = "Temperature Alert!") {
-             if (!('speechSynthesis' in window)) return false;
-             
-             // Load voices if not already loaded
-             if (!voicesLoaded) {
-                 loadBestEnglishVoice();
-                 // If still no voices, wait a bit and try again
-                 if (!voicesLoaded) {
-                     setTimeout(() => {
-                         loadBestEnglishVoice();
-                         if (voicesLoaded) playTextToSpeech(text);
-                     }, 100);
-                     return false;
-                 }
-             }
-             
-             try {
-                 // Clear any previous speech
-                 speechSynthesis.cancel();
-                 
-                 // Create clearer, simpler message for better pronunciation
-                 let clearText = text;
-                 if (text.includes("Red Alert") || text.includes("critical")) {
-                     clearText = "Warning! Temperature is too high!";
-                 } else if (text.includes("test") || text.includes("ready")) {
-                     clearText = "Audio test successful. Alert system is ready.";
-                 } else if (text.includes("complete")) {
-                     clearText = "Sound test complete. System ready.";
-                 }
-                 
-                 const utterance = new SpeechSynthesisUtterance(clearText);
-                 
-                 // Use best available voice
-                 if (bestVoice) {
-                     utterance.voice = bestVoice;
-                 }
-                 
-                 // Optimized settings for clarity
-                 utterance.volume = 1.0;
-                 utterance.rate = 0.8; // Slightly slower for clarity
-                 utterance.pitch = 1.0; // Normal pitch for best clarity
-                 
-                 // Add pauses for better understanding
-                 if (clearText.includes("Warning")) {
-                     utterance.text = "Warning. Temperature is too high.";
-                 }
-                 
-                 speechSynthesis.speak(utterance);
-                 console.log(`🗣️ Speaking (${bestVoice ? bestVoice.name : 'default'}):`, clearText);
-                 return true;
-             } catch (e) {
-                 console.log('❌ Text-to-speech failed:', e);
-                 return false;
-             }
-         }
-         
-         // Load voices when available
-         if ('speechSynthesis' in window) {
-             speechSynthesis.onvoiceschanged = loadBestEnglishVoice;
-             // Also try to load immediately
-             setTimeout(loadBestEnglishVoice, 100);
-         }
-        
-        // Try notification sound (system beep)
-        function playSystemBeep() {
-            try {
-                // Try to create a data URL for a simple beep
-                const audioElement = new Audio('data:audio/wav;base64,UklGRnoGAABXQVZFZm10IBAAAAABAAEAQB8AAEAfAAABAAgAZGF0YQoGAACBhYqFbF1fdJivrJBhNjVgodDbq2EcBj+a2/LDciUFLIHO8tiJNwgZaLvt559NEAxQp+PwtmMcBjiR1/LMeSwFJHfH8N2QQAoUXrTp66hVFApGn+DyvmwhDy2JzfPYhT0F');
-                audioElement.volume = 1.0;
-                audioElement.play().then(() => {
-                    console.log('🔔 System beep played');
-                }).catch(e => {
-                    console.log('❌ System beep failed:', e);
-                });
-                return true;
-            } catch (e) {
-                console.log('❌ System beep creation failed:', e);
-                return false;
-            }
-        }
-    </script>
-
-    <script>
-        let tempChart, humidityChart;
-        let isAlertSounding = false;
-        
-        async function fetchJson(url) {
-            try {
-                const response = await fetch(url);
-                return await response.json();
-            } catch (error) {
-                console.error('Fetch error:', error);
-                return null;
-            }
-        }
-        
-        async function postData(url, data) {
-            try {
-                const response = await fetch(url, {
-                    method: 'POST',
-                    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
-                    body: new URLSearchParams(data)
-                });
-                return await response.json();
-            } catch (error) {
-                console.error('Post error:', error);
-                return null;
-            }
-        }
-        
-        // Alert system functions
-        async function updateAlertStatus() {
-            const alertData = await fetchJson('/api/alert/get');
-            if (alertData) {
-                document.getElementById('alert-threshold').value = alertData.threshold.toFixed(1);
-                
-                const statusEl = document.getElementById('alert-status');
-                const sectionEl = document.getElementById('alert-section');
-                const warningEl = document.getElementById('alert-warning');
-                const ackButton = document.getElementById('ack-button');
-                
-                if (alertData.needs_attention) {
-                    // Alert is active and not acknowledged
-                    statusEl.innerHTML = '🚨 <span class="blink">ALERT ACTIVE</span> - Temperature exceeds threshold!';
-                    sectionEl.classList.add('alert-active');
-                    warningEl.classList.add('show');
-                    ackButton.style.display = 'inline-block';
-                    
-                    // Play alert sound if not already playing
-                    if (!isAlertSounding) {
-                        playAlertSound();
-                    }
-                } else if (alertData.active && alertData.acknowledged) {
-                    statusEl.innerHTML = '⚠️ Alert acknowledged - Temperature still above threshold';
-                    sectionEl.classList.add('alert-active');
-                    warningEl.classList.remove('show');
-                    ackButton.style.display = 'none';
-                    stopAlertSound();
-                } else {
-                    statusEl.innerHTML = '✅ Normal - Temperature within limits';
-                    sectionEl.classList.remove('alert-active');
-                    warningEl.classList.remove('show');
-                    ackButton.style.display = 'none';
-                    stopAlertSound();
-                }
-            }
-        }
-        
-        let alertInterval = null;
-        
-        function playAlertSound() {
-            if (!isAlertSounding) {
-                isAlertSounding = true;
-                console.log('🚨 RED ALERT! Temperature threshold exceeded!');
-                
-                // Multiple fallback methods for maximum compatibility
-                
-                // Method 1: Web Audio API beep (loudest)
-                if (!playLoudBeep(1000, 800)) {
-                    console.log('Web Audio failed, trying alternatives...');
-                    
-                                         // Method 2: Text-to-speech (works without user interaction)
-                     if (!playTextToSpeech("Warning! Temperature critical!")) {
-                        console.log('Text-to-speech failed, trying system beep...');
-                        
-                        // Method 3: System beep fallback
-                        playSystemBeep();
-                    }
-                }
-                
-                // Start repeating alert every 3 seconds
-                alertInterval = setInterval(() => {
-                    if (isAlertSounding) {
-                                                 if (!playLoudBeep(800, 600)) {
-                             playTextToSpeech("Warning! Temperature too high!");
-                         }
-                    }
-                }, 3000);
-            }
-        }
-        
-        function stopAlertSound() {
-            if (isAlertSounding) {
-                isAlertSounding = false;
-                
-                // Stop the repeating alert
-                if (alertInterval) {
-                    clearInterval(alertInterval);
-                    alertInterval = null;
-                }
-                
-                // Stop speech synthesis
-                if ('speechSynthesis' in window) {
-                    speechSynthesis.cancel();
-                }
-                
-                console.log('✅ Alert acknowledged - All clear');
-            }
-        }
-        
-        async function setAlertThreshold() {
-            const threshold = document.getElementById('alert-threshold').value;
-            const result = await postData('/api/alert/set', { threshold: threshold });
-            if (result && result.status === 'ok') {
-                console.log('Alert threshold set to:', threshold);
-                updateAlertStatus();
-            } else {
-                alert('Failed to set alert threshold');
-            }
-        }
-        
-        async function acknowledgeAlert() {
-            const result = await postData('/api/alert/acknowledge', {});
-            if (result) {
-                console.log('Alert acknowledged');
-                stopAlertSound();
-                updateAlertStatus();
-            }
-        }
-        
-        function testAlertSound() {
-            console.log('🔊 Testing all audio methods...');
-            
-            // Stop any current alert
-            stopAlertSound();
-            
-            // First, enable audio (required by browsers)
-            if (!enableAudio()) {
-                alert('⚠️ Audio initialization failed. Your browser may not support audio.');
-                return;
-            }
-            
-            let testStep = 0;
-            let anyTestSuccessful = false;
-            const testSteps = [
-                () => {
-                    console.log('Test 1: Loud beep');
-                    if (!playLoudBeep(1000, 1000)) {
-                        console.log('❌ Loud beep failed');
-                        return false;
-                    }
-                    anyTestSuccessful = true;
-                    return true;
-                },
-                                 () => {
-                     console.log('Test 2: Text-to-speech');
-                     const success = playTextToSpeech("Audio test successful. Alert system ready.");
-                     if (success) anyTestSuccessful = true;
-                     return success;
-                 },
-                () => {
-                    console.log('Test 3: System beep');
-                    const success = playSystemBeep();
-                    if (success) anyTestSuccessful = true;
-                    return success;
-                },
-                () => {
-                    console.log('Test 4: High frequency beep');
-                    const success = playLoudBeep(1500, 500);
-                    if (success) anyTestSuccessful = true;
-                    return success;
-                },
-                () => {
-                    console.log('Test 5: Low frequency beep');
-                    const success = playLoudBeep(600, 500);
-                    if (success) anyTestSuccessful = true;
-                    return success;
-                }
-            ];
-            
-            function runNextTest() {
-                if (testStep < testSteps.length) {
-                    const success = testSteps[testStep]();
-                    if (success) {
-                        console.log(`✅ Test ${testStep + 1} successful`);
-                    } else {
-                        console.log(`❌ Test ${testStep + 1} failed`);
-                    }
-                    testStep++;
-                    setTimeout(runNextTest, 1200); // Wait between tests
-                } else {
-                    console.log('🔇 All sound tests completed!');
-                    
-                    // Show green "Audio Ready" status if any test was successful
-                    if (anyTestSuccessful) {
-                        document.getElementById('audio-test-section').style.display = 'none';
-                        document.getElementById('audio-ready-section').style.display = 'block';
-                        console.log('✅ Audio system is ready for alerts!');
-                        
-                                             if (playTextToSpeech) {
-                         playTextToSpeech("Sound test complete. System ready.");
-                     }
-                    } else {
-                        console.log('❌ All audio tests failed. Alerts may not work properly.');
-                        alert('⚠️ All audio tests failed. Your browser may not support audio alerts.');
-                    }
-                }
-            }
-            
-            // Start the test sequence
-            runNextTest();
-        }
-        
-        function testVoiceOnly() {
-            console.log('🗣️ Testing voice only...');
-            enableAudio();
-            
-            if (playTextToSpeech("This is a voice test. Can you understand me clearly?")) {
-                console.log('✅ Voice test started');
-            } else {
-                alert('❌ Voice test failed. Text-to-speech not available.');
-            }
-        }
-        
-        function showAvailableVoices() {
-            if (!('speechSynthesis' in window)) {
-                alert('❌ Text-to-speech not supported in this browser.');
-                return;
-            }
-            
-            loadBestEnglishVoice();
-            const voices = speechSynthesis.getVoices();
-            
-            if (voices.length === 0) {
-                alert('⚠️ No voices available. Try refreshing the page.');
-                return;
-            }
-            
-            console.log('📋 Available Voices:');
-            voices.forEach((voice, index) => {
-                const selected = (bestVoice && voice.name === bestVoice.name) ? ' ✅ SELECTED' : '';
-                console.log(`${index + 1}. ${voice.name} (${voice.lang})${selected}`);
-            });
-            
-            const englishVoices = voices.filter(v => v.lang.startsWith('en'));
-            const selectedVoice = bestVoice ? `${bestVoice.name} (${bestVoice.lang})` : 'Default';
-            
-            alert(`🗣️ Voice Information:\n\n` +
-                  `Currently Selected: ${selectedVoice}\n` +
-                  `Total Voices: ${voices.length}\n` +
-                  `English Voices: ${englishVoices.length}\n\n` +
-                  `Check console (F12) for full voice list.`);
-        }
-        
-        async function updateCurrent() {
-            const current = await fetchJson('/api/current');
-            if (current && !current.error) {
-                const timeInfo = current.time_source === 'NTP' ? current.datetime : 
-                                current.time_source === 'boot_time' ? 'Time since boot: ' + current.datetime : 
-                                'No time sync';
-                
-                const sampleInfo = `${current.sample_interval}s intervals | ${current.detailed_samples} detailed + ${current.aggregated_samples} aggregated samples`;
-                
-                document.getElementById('current-data').innerHTML = 
-                    `Current: <strong>${current.t.toFixed(1)}°C</strong> | <strong>${current.h.toFixed(0)}%</strong> RH<br>
-                     <small>📅 ${timeInfo}</small><br>
-                     <small>📊 ${sampleInfo}</small>`;
-                
-                // Update system status
-                const memStatus = document.getElementById('memory-status');
-                const storageStatus = document.getElementById('storage-status');
-                const emergencyStatus = document.getElementById('emergency-status');
-                
-                const memPercent = current.memory_usage_percent || 0;
-                const freeHeap = current.free_heap_kb || 0;
-                const emergency = current.emergency_mode || false;
-                const persistent = current.persistent_storage || false;
-                
-                memStatus.innerHTML = `Memory: ${memPercent}% (${freeHeap}KB free)`;
-                memStatus.style.color = memPercent > 90 ? '#d32f2f' : memPercent > 80 ? '#ff9800' : '#4caf50';
-                
-                storageStatus.innerHTML = `Storage: ${persistent ? '✅ Active' : '❌ Failed'}`;
-                storageStatus.style.color = persistent ? '#4caf50' : '#d32f2f';
-                
-                emergencyStatus.innerHTML = `Mode: ${emergency ? '🚨 Emergency' : '✅ Normal'}`;
-                emergencyStatus.style.color = emergency ? '#d32f2f' : '#4caf50';
-            }
-            
-            // Update alert status
-            updateAlertStatus();
-        }
-        
-        async function updateCharts() {
-            const range = document.getElementById('range-select').value;
-            const history = await fetchJson('/api/history?range=' + range);
-            
-            if (!history || !history.data) return;
-            
-            // Update data info display
-            const dataInfoEl = document.getElementById('data-info');
-            if (history.sample_info) {
-                if (history.sample_info.type === 'detailed') {
-                    dataInfoEl.textContent = `${history.data.length} samples, ${history.sample_info.interval_seconds}s intervals`;
-                } else if (history.sample_info.type === 'aggregated') {
-                    dataInfoEl.textContent = `${history.data.length} samples, ${history.sample_info.interval_seconds}s intervals`;
-                } else if (history.sample_info.type === 'combined') {
-                    dataInfoEl.textContent = `${history.sample_info.detailed_count} detailed + ${history.sample_info.aggregated_count} aggregated`;
-                }
-            }
-            
-            // Format timestamps based on data source
-            const labels = history.data.map(item => {
-                if (item.ts > 1000000000) {
-                    // Real timestamp - show time appropriately
-                    const date = new Date(item.ts * 1000);
-                    if (range === 'detailed') {
-                        return date.toLocaleTimeString(); // Show time only for detailed view
-                    } else {
-                        return date.toLocaleString(); // Show date and time for aggregated
-                    }
-                } else {
-                    // Boot time - show relative time
-                    return `+${item.ts}s`;
-                }
-            });
-            
-            const temps = history.data.map(item => item.t);
-            const humidity = history.data.map(item => item.h);
-            
-            // Destroy existing charts
-            if (tempChart) tempChart.destroy();
-            if (humidityChart) humidityChart.destroy();
-            
-            // Calculate dynamic temperature range
-            const minTemp = Math.min(...temps);
-            const maxTemp = Math.max(...temps);
-            const tempRange = maxTemp - minTemp;
-            const tempPadding = Math.max(1, tempRange * 0.1); // 10% padding, minimum 1°C
-            
-            // Temperature chart
-            tempChart = new Chart(document.getElementById('temp-chart'), {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: 'Temperature (°C)',
-                        data: temps,
-                        borderColor: 'rgb(255, 99, 132)',
-                        backgroundColor: 'rgba(255, 99, 132, 0.1)',
-                        tension: 0.1
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    scales: {
-                        y: {
-                            min: minTemp - tempPadding,
-                            max: maxTemp + tempPadding,
-                            ticks: {
-                                callback: function(value) {
-                                    return value.toFixed(1) + '°C';
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-            
-            // Calculate dynamic humidity range
-            const minHum = Math.min(...humidity);
-            const maxHum = Math.max(...humidity);
-            const humRange = maxHum - minHum;
-            const humPadding = Math.max(2, humRange * 0.1); // 10% padding, minimum 2%
-            
-            // Keep humidity within reasonable bounds (0-100%)
-            const humMin = Math.max(0, minHum - humPadding);
-            const humMax = Math.min(100, maxHum + humPadding);
-            
-            // Humidity chart
-            humidityChart = new Chart(document.getElementById('humidity-chart'), {
-                type: 'line',
-                data: {
-                    labels: labels,
-                    datasets: [{
-                        label: 'Humidity (%)',
-                        data: humidity,
-                        borderColor: 'rgb(54, 162, 235)',
-                        backgroundColor: 'rgba(54, 162, 235, 0.1)',
-                        tension: 0.1
-                    }]
-                },
-                options: {
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    scales: {
-                        y: {
-                            min: humMin,
-                            max: humMax,
-                            ticks: {
-                                callback: function(value) {
-                                    return value.toFixed(0) + '%';
-                                }
-                            }
-                        }
-                    }
-                }
-            });
-        }
-        
-        // Event listeners
-        document.getElementById('range-select').addEventListener('change', updateCharts);
-        
-        // Initial load
-        updateCurrent();
-        updateCharts();
-        updateAlertStatus();
-        
-        // Update current data and alerts every 30 seconds (matches sensor sampling)
-        setInterval(updateCurrent, 30000);
-        
-        // Update charts every 30 seconds for detailed view, less frequently for others
-        setInterval(() => {
-            const range = document.getElementById('range-select').value;
-            if (range === 'detailed') {
-                updateCharts(); // Update frequently for detailed view
-            }
-        }, 30000);
-        
-        // Update charts for aggregated views every 5 minutes
-        setInterval(() => {
-            const range = document.getElementById('range-select').value;
-            if (range !== 'detailed') {
-                updateCharts();
-            }
-        }, 300000);
-    </script>
-</body>
-</html>
-)rawliteral";
+  // Ultra-compact HTML - all functionality preserved but much smaller for ESP32 memory
+  String html = F("<!DOCTYPE html><html><head><meta charset=\"utf-8\"><title>REUTERS UW-CAM1 Environmental Monitor</title><script src=\"https://cdn.jsdelivr.net/npm/chart.js\"></script><style>*{margin:0;padding:0;box-sizing:border-box}body{font-family:Arial,sans-serif;background:#1a1a1a;color:#e0e0e0;line-height:1.4}.header{background:linear-gradient(135deg,#2c3e50,#34495e);padding:8px 16px;border-bottom:2px solid #3498db;display:flex;justify-content:space-between;align-items:center}.header h1{font-size:16px;color:#ecf0f1;margin:0}.header .timestamp{font-size:12px;color:#bdc3c7}.container{padding:12px}.status-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:8px;margin-bottom:12px}.status-panel{background:#2c3e50;border:1px solid #34495e;border-radius:4px;padding:8px;text-align:center;min-height:70px;display:flex;flex-direction:column;justify-content:center}.status-panel.alert{border-color:#e74c3c;background:#c0392b;animation:alertBlink 1s infinite}@keyframes alertBlink{0%,100%{opacity:1}50%{opacity:0.7}}.status-value{font-size:24px;font-weight:bold;color:#ecf0f1}.status-label{font-size:11px;color:#bdc3c7;margin-top:2px}.status-unit{font-size:14px;color:#95a5a6}.monitoring-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}.control-section{background:#34495e;border:1px solid #5d6d7e;border-radius:4px;margin-bottom:8px;overflow:hidden}.control-header{background:#2c3e50;padding:6px 12px;border-bottom:1px solid #5d6d7e;font-size:12px;font-weight:bold;color:#ecf0f1}.control-content{padding:8px 12px}.control-row{display:flex;align-items:center;gap:8px;margin-bottom:6px;font-size:12px}.control-row:last-child{margin-bottom:0}input[type=\"number\"]{width:60px;padding:4px 6px;background:#2c3e50;border:1px solid #5d6d7e;border-radius:3px;color:#ecf0f1;font-size:12px}select{padding:4px 6px;background:#2c3e50;border:1px solid #5d6d7e;border-radius:3px;color:#ecf0f1;font-size:12px}button{padding:4px 8px;background:#3498db;border:none;border-radius:3px;color:white;font-size:11px;cursor:pointer}button:hover{background:#2980b9}button.danger{background:#e74c3c}button.warning{background:#f39c12}.charts-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:12px}.chart-panel{background:#34495e;border:1px solid #5d6d7e;border-radius:4px;padding:8px;height:250px}.chart-title{font-size:12px;font-weight:bold;color:#ecf0f1;margin-bottom:8px;text-align:center}canvas{max-height:220px}.system-status{display:flex;gap:12px;font-size:10px;color:#95a5a6;margin-top:8px}.status-indicator{display:flex;align-items:center;gap:4px}.status-led{width:8px;height:8px;border-radius:50%;background:#27ae60}.status-led.warning{background:#f39c12}.status-led.error{background:#e74c3c}@media (max-width:768px){.status-grid{grid-template-columns:1fr 1fr}.monitoring-grid{grid-template-columns:1fr}.charts-grid{grid-template-columns:1fr}}</style></head><body><div class=\"header\"><h1>REUTERS UW-CAM1 -- ENVIRONMENTAL MONITORING SYSTEM</h1><div class=\"timestamp\" id=\"t\">--:--:--</div></div><div class=\"container\"><div class=\"status-grid\"><div class=\"status-panel\" id=\"tp\"><div class=\"status-value\" id=\"tv\">--</div><div class=\"status-label\">TEMPERATURE <span class=\"status-unit\">°C</span></div></div><div class=\"status-panel\" id=\"hp\"><div class=\"status-value\" id=\"hv\">--</div><div class=\"status-label\">HUMIDITY <span class=\"status-unit\">%</span></div></div><div class=\"status-panel\"><div class=\"status-value\" id=\"mv\">--</div><div class=\"status-label\">MEMORY <span class=\"status-unit\">%</span></div></div><div class=\"status-panel\"><div class=\"status-value\" id=\"uv\">--</div><div class=\"status-label\">UPTIME</div></div></div><div class=\"monitoring-grid\"><div class=\"control-section\"><div class=\"control-header\">TEMPERATURE MONITORING</div><div class=\"control-content\"><div class=\"control-row\"><span>Threshold:</span><input type=\"number\" id=\"at\" min=\"0\" max=\"100\" step=\"0.1\" value=\"40.0\"><span>°C</span><button onclick=\"setTemp()\">SET</button><span id=\"ts\">NORMAL</span><button id=\"ab\" onclick=\"ackTemp()\" class=\"danger\" style=\"display:none;\">ACK</button></div></div></div><div class=\"control-section\"><div class=\"control-header\">HUMIDITY MONITORING</div><div class=\"control-content\"><div class=\"control-row\"><span>Threshold:</span><input type=\"number\" id=\"ht\" min=\"0\" max=\"100\" step=\"0.1\" value=\"90.0\"><span>%</span><button onclick=\"setHum()\">SET</button><span id=\"hs\">NORMAL</span><button id=\"hb\" onclick=\"ackHum()\" class=\"danger\" style=\"display:none;\">ACK</button></div></div></div></div><div class=\"charts-grid\"><div class=\"chart-panel\"><div class=\"chart-title\">TEMPERATURE TREND</div><canvas id=\"tc\"></canvas></div><div class=\"chart-panel\"><div class=\"chart-title\">HUMIDITY TREND</div><canvas id=\"hc\"></canvas></div></div><div class=\"control-section\"><div class=\"control-header\">DATA VIEW</div><div class=\"control-content\"><div class=\"control-row\"><span>Range:</span><select id=\"rs\"><option value=\"detailed\">30s intervals (30min)</option><option value=\"aggregated\">5min intervals (24h)</option><option value=\"all\">All data</option></select><span id=\"di\">--</span></div></div></div><div class=\"control-section\"><div class=\"control-header\">AUDIO ALERT SYSTEM</div><div class=\"control-content\"><div class=\"control-row\"><button onclick=\"testAudio()\" class=\"warning\">TEST AUDIO</button><span id=\"as\">CLICK TEST TO ENABLE</span></div></div></div><div class=\"system-status\"><div class=\"status-indicator\"><div class=\"status-led\" id=\"sl\"></div><span id=\"ss\">STORAGE: --</span></div><div class=\"status-indicator\"><div class=\"status-led\"></div><span>NETWORK: CONNECTED</span></div><div class=\"status-indicator\"><div class=\"status-led\" id=\"el\"></div><span id=\"es\">MODE: --</span></div></div></div><script>let tC,hC,ctx,audio=false,alert=false,timer;async function get(u){try{return await(await fetch(u)).json()}catch{return null}}async function post(u,d){try{const p=new URLSearchParams(d);return await(await fetch(u+'?'+p.toString(),{method:'POST'})).json()}catch{return null}}function beep(f=1000,d=500){try{if(!ctx)ctx=new(window.AudioContext||window.webkitAudioContext)();if(ctx.state==='suspended')ctx.resume();const o=ctx.createOscillator(),g=ctx.createGain();o.connect(g);g.connect(ctx.destination);o.type='square';o.frequency.value=f;g.gain.setValueAtTime(0,ctx.currentTime);g.gain.linearRampToValueAtTime(0.3,ctx.currentTime+0.01);g.gain.exponentialRampToValueAtTime(0.001,ctx.currentTime+d/1000);o.start();o.stop(ctx.currentTime+d/1000);return true}catch{return false}}function speak(t){try{speechSynthesis.cancel();const u=new SpeechSynthesisUtterance(t);u.volume=1;speechSynthesis.speak(u);return true}catch{return false}}function startAlert(t){if(!alert){alert=true;let msg=t===\"humidity\"?\"Humidity alert\":\"Temperature alert\";if(timer){clearInterval(timer);timer=null}timer=setInterval(()=>{if(alert){if(!beep(1200,400))speak(msg)}},1000)}}function stopAlert(){if(alert){alert=false;if(timer){clearInterval(timer);timer=null}if(speechSynthesis)speechSynthesis.cancel();setTimeout(()=>{beep(800,200);setTimeout(()=>beep(600,200),250)},100)}}async function updateAlerts(){const ta=await get('/api/alert/get');if(ta){document.getElementById('at').value=ta.threshold.toFixed(1);const s=document.getElementById('ts'),p=document.getElementById('tp'),b=document.getElementById('ab');if(ta.needs_attention){s.textContent='CRITICAL - CLICK ACK!';s.style.color='#e74c3c';s.style.fontWeight='bold';s.style.animation='alertBlink 0.5s infinite';p.classList.add('alert');b.style.display='inline-block';b.style.animation='alertBlink 0.5s infinite';if(!alert)startAlert(\"temperature\")}else if(ta.active&&ta.acknowledged){s.textContent='HIGH (ACK)';s.style.color='#f39c12';p.classList.add('alert');b.style.display='none';stopAlert()}else{s.textContent='NORMAL';s.style.color='#27ae60';p.classList.remove('alert');b.style.display='none';stopAlert()}}const ha=await get('/api/humidity-alert/get');if(ha){document.getElementById('ht').value=ha.threshold.toFixed(1);const s=document.getElementById('hs'),p=document.getElementById('hp'),b=document.getElementById('hb');if(ha.needs_attention){s.textContent='CRITICAL';s.style.color='#e74c3c';p.classList.add('alert');b.style.display='inline-block';if(!alert)startAlert(\"humidity\")}else if(ha.active&&ha.acknowledged){s.textContent='HIGH (ACK)';s.style.color='#f39c12';p.classList.add('alert');b.style.display='none';stopAlert()}else{s.textContent='NORMAL';s.style.color='#27ae60';p.classList.remove('alert');b.style.display='none';stopAlert()}}}async function updateCurrent(){const c=await get('/api/current');if(c&&!c.error){document.getElementById('tv').textContent=c.t.toFixed(1);document.getElementById('hv').textContent=c.h.toFixed(0);document.getElementById('mv').textContent=c.memory_usage_percent||'--';const us=c.uptime_seconds||0,uh=Math.floor(us/3600),um=Math.floor((us%3600)/60);document.getElementById('uv').textContent=uh>0?uh+'h'+(um>0?um+'m':''):um+'m';document.getElementById('t').textContent=new Date().toLocaleTimeString();const ps=c.persistent_storage||false,em=c.emergency_mode||false;const sl=document.getElementById('sl'),ss=document.getElementById('ss');if(ps){sl.className='status-led';ss.textContent='STORAGE: ACTIVE'}else{sl.className='status-led error';ss.textContent='STORAGE: FAILED'}const el=document.getElementById('el'),es=document.getElementById('es');if(em){el.className='status-led error';es.textContent='MODE: EMERGENCY'}else{el.className='status-led';es.textContent='MODE: NORMAL'}document.getElementById('di').textContent=`${c.detailed_samples}/${c.aggregated_samples} samples`}updateAlerts()}async function updateCharts(){const r=document.getElementById('rs').value,h=await get('/api/history?range='+r);if(!h||!h.data)return;const l=h.data.map(i=>{if(i.ts>1000000000){const d=new Date(i.ts*1000);return r==='detailed'?d.toLocaleTimeString():d.toLocaleString()}else{return`+${i.ts}s`}}),t=h.data.map(i=>i.t),hum=h.data.map(i=>i.h);if(tC)tC.destroy();if(hC)hC.destroy();tC=new Chart(document.getElementById('tc'),{type:'line',data:{labels:l,datasets:[{label:'Temperature (°C)',data:t,borderColor:'rgb(255,99,132)',backgroundColor:'rgba(255,99,132,0.1)',tension:0.1}]},options:{responsive:true,maintainAspectRatio:true}});hC=new Chart(document.getElementById('hc'),{type:'line',data:{labels:l,datasets:[{label:'Humidity (%)',data:hum,borderColor:'rgb(54,162,235)',backgroundColor:'rgba(54,162,235,0.1)',tension:0.1}]},options:{responsive:true,maintainAspectRatio:true}})}async function setTemp(){const t=parseFloat(document.getElementById('at').value),r=await post('/api/alert/set',{threshold:t});if(r&&r.status==='ok')updateAlerts();else alert('Failed to set temperature threshold')}async function setHum(){const t=parseFloat(document.getElementById('ht').value),r=await post('/api/humidity-alert/set',{threshold:t});if(r&&r.status==='ok')updateAlerts();else alert('Failed to set humidity threshold')}async function ackTemp(){const r=await post('/api/alert/acknowledge',{});if(r){stopAlert();updateAlerts()}}async function ackHum(){const r=await post('/api/humidity-alert/acknowledge',{});if(r){stopAlert();updateAlerts()}}function testAudio(){if(!audio){if(beep(1000,800)){audio=true;document.getElementById('as').textContent='AUDIO READY';document.getElementById('as').style.color='#27ae60'}else{document.getElementById('as').textContent='AUDIO FAILED';document.getElementById('as').style.color='#e74c3c'}}else{startAlert(\"test\");setTimeout(stopAlert,3000)}}document.getElementById('rs').addEventListener('change',updateCharts);updateCurrent();updateCharts();setInterval(updateCurrent,30000);setInterval(()=>{const r=document.getElementById('rs').value;if(r==='detailed')updateCharts()},30000);setInterval(()=>{const r=document.getElementById('rs').value;if(r!=='detailed')updateCharts()},300000);</script></body></html>");
   
   req->send(200, "text/html", html);
 }
@@ -1571,6 +874,9 @@ void setup() {
   server.on("/api/alert/get", HTTP_GET, handleGetAlert);
   server.on("/api/alert/set", HTTP_POST, handleSetAlert);
   server.on("/api/alert/acknowledge", HTTP_POST, handleAckAlert);
+  server.on("/api/humidity-alert/get", HTTP_GET, handleGetHumidityAlert);
+  server.on("/api/humidity-alert/set", HTTP_POST, handleSetHumidityAlert);
+  server.on("/api/humidity-alert/acknowledge", HTTP_POST, handleAckHumidityAlert);
   server.on("/api/save", HTTP_POST, handleSaveData);
   
   // Start server
